@@ -229,8 +229,12 @@ def build_map_html(
         }}
     }})();
     """
-    fmap.get_root().script.add_child(folium.Element(js))
-    return fmap.get_root().render()
+    fmap.get_root().header.add_child(
+        folium.Element(f"<style>html, body, .folium-map {{ background: {BG} !important; margin: 0; }}</style>")
+    )
+    raw_html = fmap.get_root().render()
+    idx = raw_html.rfind("</script>")
+    return raw_html[:idx] + js + "\n" + raw_html[idx:] if idx != -1 else raw_html + f"<script>{js}</script>"
 
 
 # ---------------------------------------------------------------------------
