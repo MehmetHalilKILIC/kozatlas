@@ -92,15 +92,24 @@ def fmt_int(x) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Data Loading (Cached)
+# Data Loading & Cached Analytics
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Loading demo archive…")
-def load_synthetic(y0: int, y1: int, seed: int = 42) -> pd.DataFrame:
+@st.cache_resource(show_spinner="Loading demo archive…")
+def _load_full_demo_archive(seed: int = 42) -> pd.DataFrame:
     p = Path(__file__).resolve().parent / "data" / "demo_firms.parquet"
     if p.exists() and seed == 42:
-        df = pd.read_parquet(p)
-        return df[(df["acq_date"].dt.year >= y0) & (df["acq_date"].dt.year <= y1)].reset_index(drop=True)
-    return hz.standardize_firms(hz.SyntheticFIRMSGenerator(seed=seed).generate(y0, y1))
+        return pd.read_parquet(p)
+    return hz.standardize_firms(hz.SyntheticFIRMSGenerator(seed=seed).generate(2000, 2025))
+
+
+@st.cache_data(show_spinner="Loading demo archive…")
+def load_synthetic(y0: int, y1: int, seed: int = 42) -> pd.DataFrame:
+    df = _load_full_demo_archive(seed)
+    yrs = df["acq_date"].dt.year
+    m = (yrs >= y0) & (yrs <= y1)
+    if m.all():
+        return df
+    return df[m].reset_index(drop=True)
 
 
 @st.cache_data(show_spinner="Fetching telemetry from NASA FIRMS Area API…", ttl=3600)
@@ -119,6 +128,40 @@ def load_csv(blobs: tuple) -> pd.DataFrame:
 def run_cached(std: pd.DataFrame, bbox: tuple, d0: date, d1: date, params: dict) -> hz.PipelineResult:
     data = hz.filter_dates(hz.filter_aoi(std, bbox), d0, d1) if not std.empty else std
     return hz.run_pipeline(data, hz.PipelineParams(**params))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_monthly_matrix(events: pd.DataFrame, metric: str, cell_km: float) -> pd.DataFrame:
+    return hz.monthly_matrix(events, metric, cell_km=cell_km)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_annual_series(points: pd.DataFrame, events: pd.DataFrame, cell_km: float) -> pd.DataFrame:
+    return hz.annual_series(points, events, cell_km=cell_km)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_export_bundle(
+    events: pd.DataFrame, points: pd.DataFrame, static_sites: pd.DataFrame
+) -> tuple[pd.DataFrame, bytes, bytes | None, bytes]:
+    out = hz.export_table(events)
+    out_csv = out.to_csv(index=False).encode("utf-8")
+
+    sites_csv = None
+    if not static_sites.empty:
+        sites = static_sites.copy()
+        for c in ("first_seen", "last_seen"):
+            sites[c] = hz._fast_format_date(sites[c])
+        sites_csv = sites.to_csv(index=False).encode("utf-8")
+
+    raw_cols = [
+        "point_id", "unified_hotspot_id", "latitude", "longitude", "utc_timestamp", "instrument", "satellite",
+        "source", "frp", "brightness_k", "brightness_2_k", "scan", "track", "conf_class", "daynight", "is_static_source",
+    ]
+    raw_out = points[raw_cols].copy()
+    raw_out["utc_timestamp"] = hz._fast_format_utc(raw_out["utc_timestamp"])
+    raw_csv = raw_out.to_csv(index=False).encode("utf-8")
+    return out, out_csv, sites_csv, raw_csv
 
 
 # ---------------------------------------------------------------------------
@@ -256,15 +299,16 @@ tab_map, tab_cal, tab_proof, tab_dl = st.tabs(
 # Tab 1 — Interactive Satellite Map
 # ---------------------------------------------------------------------------
 with tab_map:
-    months = events_view["acq_date"].dt.to_period("M")
-    month_counts = months.value_counts().sort_index()
-    if month_counts.empty:
+    ev_ym = events_view["acq_date"].dt.year * 100 + events_view["acq_date"].dt.month
+    ym_counts = ev_ym.value_counts().sort_index()
+    if ym_counts.empty:
         st.info("No events to display on the map.")
     else:
-        options = [str(p) for p in month_counts.index]
-        last_year = month_counts.index.max().year
-        recent = month_counts[[p.year == last_year for p in month_counts.index]]
-        default = str(recent.idxmax())
+        options = [f"{ym // 100:04d}-{ym % 100:02d}" for ym in ym_counts.index]
+        last_year = int(ym_counts.index.max()) // 100
+        recent = ym_counts[ym_counts.index >= last_year * 100]
+        best_ym = int(recent.idxmax())
+        default = f"{best_ym // 100:04d}-{best_ym % 100:02d}"
         c1, c2 = st.columns([1, 3])
         sel_month = c1.selectbox("Observation period (month)", options[::-1], index=options[::-1].index(default))
         basemap = c1.radio("Basemap", ["Dark Canvas (Esri Dark Gray)", "Satellite Imagery (Esri World Imagery)"])
@@ -278,9 +322,11 @@ with tab_map:
             unsafe_allow_html=True,
         )
 
-        per = pd.Period(sel_month)
-        ev_m = events_view[events_view["acq_date"].dt.to_period("M") == per]
-        pt_m = points_view[points_view["acq_date"].dt.to_period("M") == per]
+        sel_y, sel_m = int(sel_month[:4]), int(sel_month[5:7])
+        target_ym = sel_y * 100 + sel_m
+        pt_ym = points_view["acq_date"].dt.year * 100 + points_view["acq_date"].dt.month
+        ev_m = events_view[ev_ym == target_ym]
+        pt_m = points_view[pt_ym == target_ym]
         if len(ev_m) > MAP_LAYER_CAP:
             ev_m = ev_m.nlargest(MAP_LAYER_CAP, "calibrated_frp_mw")
             pt_m = pt_m[pt_m["unified_hotspot_id"].isin(ev_m["unified_hotspot_id"])]
@@ -290,7 +336,7 @@ with tab_map:
         zoom = 6 if (bbox[2] - bbox[0]) > 8 else 8
         tile_url, tile_attr = (DARK_TILES, "Esri, HERE, Garmin, OpenStreetMap contributors") if basemap.startswith("Dark") \
             else (SAT_TILES, "Esri World Imagery")
-        fmap = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True)
+        fmap = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True, prefer_canvas=True)
         folium.TileLayer(tiles=tile_url, attr=tile_attr, name=basemap, max_zoom=16 if basemap.startswith("Dark") else 19).add_to(fmap)
         folium.Rectangle([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], color=EMBER, weight=1, fill=False, dash_array="6").add_to(fmap)
 
@@ -372,7 +418,7 @@ with tab_map:
 with tab_cal:
     c1, c2, c3 = st.columns([2, 1, 1])
     metric = c1.selectbox("Calendar metric", list(hz.CALENDAR_METRICS), format_func=hz.CALENDAR_METRICS.get)
-    mat = hz.monthly_matrix(events_view, metric, cell_km=params["static_cell_km"])
+    mat = _cached_monthly_matrix(events_view, metric, cell_km=params["static_cell_km"])
     years = list(mat.index)
     sel_year = c2.selectbox("Year", years[::-1])
     sel_mon = c3.selectbox("Month", list(range(1, 13)), index=int(events_view["acq_date"].dt.month.mode().iloc[0]) - 1,
@@ -446,7 +492,7 @@ with tab_cal:
 # Tab 3 — Sensor Harmonization Evidence
 # ---------------------------------------------------------------------------
 with tab_proof:
-    ann = hz.annual_series(points_view, events_view, cell_km=params["static_cell_km"])
+    ann = _cached_annual_series(points_view, events_view, cell_km=params["static_cell_km"])
     series_cols = {
         "Raw Total (MODIS+VIIRS)": "#64748B",
         "Raw MODIS Pixels": C_MODIS,
@@ -531,28 +577,21 @@ with tab_proof:
 # Tab 4 — Data Download Center
 # ---------------------------------------------------------------------------
 with tab_dl:
-    out = hz.export_table(events_view)
+    out, out_csv, sites_csv, raw_csv = _cached_export_bundle(events_view, points_view, res.static_sites)
     st.markdown(f"**Harmonized Hotspots Table** — {fmt_int(len(out))} records · {d0} to {d1} · {aoi_name}")
     st.dataframe(out.head(500), width="stretch", hide_index=True)
     st.download_button(
         "⬇️ Download koz_atlas_harmonized_hotspots.csv",
-        out.to_csv(index=False).encode("utf-8"),
+        out_csv,
         file_name="koz_atlas_harmonized_hotspots.csv",
         mime="text/csv",
         type="primary",
     )
     c1, c2, c3 = st.columns(3)
-    if not res.static_sites.empty:
-        sites = res.static_sites.copy()
-        for c in ("first_seen", "last_seen"):
-            sites[c] = sites[c].dt.strftime("%Y-%m-%d")
-        c1.download_button("Download Static Sources (CSV)", sites.to_csv(index=False).encode("utf-8"),
+    if sites_csv is not None:
+        c1.download_button("Download Static Sources (CSV)", sites_csv,
                            file_name="koz_atlas_static_sources.csv", mime="text/csv")
-    raw_cols = ["point_id", "unified_hotspot_id", "latitude", "longitude", "utc_timestamp", "instrument", "satellite",
-                "source", "frp", "brightness_k", "brightness_2_k", "scan", "track", "conf_class", "daynight", "is_static_source"]
-    raw_out = points_view[raw_cols].copy()
-    raw_out["utc_timestamp"] = raw_out["utc_timestamp"].dt.strftime("%Y-%m-%dT%H:%MZ")
-    c2.download_button("Download Raw Pixel → Event Map (CSV)", raw_out.to_csv(index=False).encode("utf-8"),
+    c2.download_button("Download Raw Pixel → Event Map (CSV)", raw_csv,
                        file_name="koz_atlas_pixel_event_map.csv", mime="text/csv")
     meta = {
         "project": "KOZ Atlas",

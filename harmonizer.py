@@ -15,6 +15,7 @@ import calendar
 import io
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -72,7 +73,8 @@ def haversine_km(lat1, lon1, lat2, lon2) -> np.ndarray:
 
 def _unit_sphere_xyz(lat, lon) -> np.ndarray:
     phi, lmb = np.radians(lat), np.radians(lon)
-    return np.column_stack([np.cos(phi) * np.cos(lmb), np.cos(phi) * np.sin(lmb), np.sin(phi)])
+    c_phi = np.cos(phi)
+    return np.column_stack([c_phi * np.cos(lmb), c_phi * np.sin(lmb), np.sin(phi)])
 
 
 def _grid_keys(lat: np.ndarray, lon: np.ndarray, cell_km: float, offset: float = 0.0) -> np.ndarray:
@@ -85,11 +87,72 @@ def _grid_keys(lat: np.ndarray, lon: np.ndarray, cell_km: float, offset: float =
     return iy * 10_000_000 + ix
 
 
+def _spatial_components(lat: np.ndarray, lon: np.ndarray, distance_km: float) -> np.ndarray:
+    """
+    Yalnızca mekansal Haversine (Δd ≤ distance_km) tek bağlantılı kümeleme (statik kaynak birleştirme).
+    Köşegeni ≤ distance_km olan mikro-hücrelerdeki noktalar garanti olarak birbirine bağlıdır;
+    önce mikro-hücre bazında indirgeme yapılarak yoğun kümelerdeki O(N²) çift patlaması önlenir.
+    """
+    n = len(lat)
+    if n == 0:
+        return np.array([], dtype=int)
+    micro_km = distance_km / 1.5  # mikro-hücre köşegeni < distance_km
+    m_keys = _grid_keys(lat, lon, micro_km, 0.0)
+    uniq_m, first_idx, m_inv = np.unique(m_keys, return_index=True, return_inverse=True)
+    n_m = len(uniq_m)
+    if n_m == 1:
+        return np.zeros(n, dtype=int)
+
+    rep_lat, rep_lon = lat[first_idx], lon[first_idx]
+    xyz = _unit_sphere_xyz(rep_lat, rep_lon)
+    chord_max = 2.0 * np.sin((distance_km * 2.5) / (2.0 * EARTH_RADIUS_KM))
+    cand_pairs = cKDTree(xyz).query_pairs(r=chord_max, output_type="ndarray")
+
+    if len(cand_pairs) == 0:
+        first_appear = np.full(n_m, n + 1, dtype=int)
+        np.minimum.at(first_appear, m_inv, np.arange(n))
+        rank = np.argsort(np.argsort(first_appear))
+        return rank[m_inv]
+
+    order = np.argsort(m_inv, kind="stable")
+    sorted_m = m_inv[order]
+    splits = np.searchsorted(sorted_m, np.arange(n_m))
+    splits_end = np.append(splits[1:], n)
+    chord_exact = 2.0 * np.sin(distance_km / (2.0 * EARTH_RADIUS_KM)) * (1 + 1e-9)
+
+    edges_u, edges_v = [], []
+    for u, v in cand_pairs:
+        if haversine_km(rep_lat[u], rep_lon[u], rep_lat[v], rep_lon[v]) <= distance_km:
+            edges_u.append(u)
+            edges_v.append(v)
+            continue
+        idx_u = order[splits[u]:splits_end[u]]
+        idx_v = order[splits[v]:splits_end[v]]
+        xyz_u = _unit_sphere_xyz(lat[idx_u], lon[idx_u])
+        xyz_v = _unit_sphere_xyz(lat[idx_v], lon[idx_v])
+        hit = cKDTree(xyz_u).query_ball_tree(cKDTree(xyz_v), r=chord_exact)
+        for ii, nbrs in enumerate(hit):
+            if nbrs:
+                jj = idx_v[nbrs]
+                if np.any(haversine_km(lat[idx_u[ii]], lon[idx_u[ii]], lat[jj], lon[jj]) <= distance_km):
+                    edges_u.append(u)
+                    edges_v.append(v)
+                    break
+
+    graph = coo_matrix((np.ones(len(edges_u), dtype=np.int8), (edges_u, edges_v)), shape=(n_m, n_m))
+    _, comp_m = connected_components(graph, directed=False)
+    pt_comp = comp_m[m_inv]
+    first_appear = np.full(int(pt_comp.max()) + 1, n + 1, dtype=int)
+    np.minimum.at(first_appear, pt_comp, np.arange(n))
+    rank = np.argsort(np.argsort(first_appear))
+    return rank[pt_comp]
+
+
 # ---------------------------------------------------------------------------
 # Aşama 1 — Veri çekme ve şema standardizasyonu
 # ---------------------------------------------------------------------------
 class FIRMSClient:
-    """NASA FIRMS Area API istemcisi (CSV)."""
+    """NASA FIRMS Area API istemcisi (CSV, paralel HTTP çekimi destekli)."""
 
     def __init__(self, map_key: str, timeout: int = 60):
         if not map_key or not map_key.strip():
@@ -112,7 +175,7 @@ class FIRMSClient:
         )
 
     def request_plan(self, source: str, bbox, start: date, end: date) -> list[str]:
-        """[start, end] aralığını 10 günlük parçalara bölüp URL listesi döndürür."""
+        """[start, end] aralığını 5 günlük parçalara bölüp URL listesi döndürür."""
         urls, cur = [], start
         while cur <= end:
             span = min(FIRMS_MAX_DAY_RANGE, (end - cur).days + 1)
@@ -133,17 +196,32 @@ class FIRMSClient:
         return pd.read_csv(io.StringIO(text))
 
     def fetch(self, sources: list[str], bbox, start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
-        frames, errors = [], []
+        tasks: list[tuple[int, str, str]] = []
+        idx = 0
         for src in sources:
             for url in self.request_plan(src, bbox, start, end):
+                tasks.append((idx, src, url))
+                idx += 1
+        if not tasks:
+            return pd.DataFrame(), []
+
+        results: dict[int, pd.DataFrame] = {}
+        err_map: dict[int, str] = {}
+        max_workers = min(8, len(tasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            fut_to_task = {pool.submit(self._get, url): (i, src) for i, src, url in tasks}
+            for fut in as_completed(fut_to_task):
+                i, src = fut_to_task[fut]
                 try:
-                    df = self._get(url)
+                    df = fut.result()
+                    if len(df):
+                        df["source"] = src
+                        results[i] = df
                 except (urllib.error.URLError, RuntimeError, pd.errors.ParserError, TimeoutError) as exc:
-                    errors.append(f"{src}: {exc}")
-                    continue
-                if len(df):
-                    df["source"] = src
-                    frames.append(df)
+                    err_map[i] = f"{src}: {exc}"
+
+        errors = [err_map[k] for k in sorted(err_map)]
+        frames = [results[k] for k in sorted(results)]
         if not frames:
             return pd.DataFrame(), errors
         return pd.concat(frames, ignore_index=True), errors
@@ -189,15 +267,19 @@ def standardize_firms(df: pd.DataFrame) -> pd.DataFrame:
     """FIRMS MODIS ve VIIRS CSV'lerini tek ortak şemaya dönüştürür."""
     if df is None or df.empty:
         return pd.DataFrame()
-    d = df.copy()
-    d.columns = [str(c).strip().lower() for c in d.columns]
+    d = df.rename(columns=lambda c: str(c).strip().lower())
     required = {"latitude", "longitude", "acq_date", "acq_time"}
     missing = required - set(d.columns)
     if missing:
         raise ValueError(f"Eksik zorunlu FIRMS sütunları: {sorted(missing)}")
 
     def num(col):
-        return pd.to_numeric(d[col], errors="coerce") if col in d else pd.Series(np.nan, index=d.index)
+        if col not in d:
+            return pd.Series(np.nan, index=d.index, dtype="float64")
+        s = d[col]
+        if pd.api.types.is_numeric_dtype(s):
+            return s.astype("float64", copy=False)
+        return pd.to_numeric(s, errors="coerce")
 
     out = pd.DataFrame(index=d.index)
     out["latitude"] = num("latitude")
@@ -212,12 +294,10 @@ def standardize_firms(df: pd.DataFrame) -> pd.DataFrame:
     out["frp"] = num("frp").fillna(0.0).clip(lower=0.0)
 
     hhmm = num("acq_time").fillna(0).astype(int).clip(0, 2359)
-    out["utc_timestamp"] = (
-        pd.to_datetime(d["acq_date"], errors="coerce")
-        + pd.to_timedelta(hhmm // 100, unit="h")
-        + pd.to_timedelta(hhmm % 100, unit="m")
-    )
-    out["acq_date"] = out["utc_timestamp"].dt.normalize()
+    acq_dt = pd.to_datetime(d["acq_date"], errors="coerce")
+    total_mins = (hhmm // 100) * 60 + (hhmm % 100)
+    out["utc_timestamp"] = acq_dt + pd.to_timedelta(total_mins, unit="m")
+    out["acq_date"] = acq_dt.dt.normalize()
 
     out["satellite"] = d["satellite"].astype(str) if "satellite" in d else out["instrument"]
     out["confidence_raw"] = d["confidence"].astype(str) if "confidence" in d else ""
@@ -230,7 +310,9 @@ def standardize_firms(df: pd.DataFrame) -> pd.DataFrame:
     out["version"] = d["version"].astype(str) if "version" in d else ""
     out["source"] = d["source"].astype(str) if "source" in d else out["instrument"]
 
-    out = out.dropna(subset=["latitude", "longitude", "utc_timestamp"])
+    valid = out["latitude"].notna() & out["longitude"].notna() & out["utc_timestamp"].notna()
+    if not valid.all():
+        out = out[valid]
     out = out.sort_values("utc_timestamp", kind="stable").reset_index(drop=True)
     out["point_id"] = np.arange(len(out))
     return out
@@ -238,17 +320,30 @@ def standardize_firms(df: pd.DataFrame) -> pd.DataFrame:
 
 def filter_aoi(df: pd.DataFrame, bbox) -> pd.DataFrame:
     w, s, e, n = bbox
-    m = df["longitude"].between(w, e) & df["latitude"].between(s, n)
+    lat = df["latitude"].to_numpy()
+    lon = df["longitude"].to_numpy()
+    m = (lon >= w) & (lon <= e) & (lat >= s) & (lat <= n)
+    if m.all():
+        return df.reset_index(drop=True)
     return df[m].reset_index(drop=True)
 
 
 def filter_dates(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    m = df["acq_date"].between(pd.Timestamp(start), pd.Timestamp(end))
+    t0, t1 = pd.Timestamp(start), pd.Timestamp(end)
+    ad = df["acq_date"]
+    m = (ad >= t0) & (ad <= t1)
+    if m.all():
+        return df.reset_index(drop=True)
     return df[m].reset_index(drop=True)
 
 
 def filter_confidence(df: pd.DataFrame, min_level: int) -> pd.DataFrame:
-    return df[df["conf_level"] >= int(min_level)].reset_index(drop=True)
+    if int(min_level) <= 0:
+        return df.reset_index(drop=True)
+    m = df["conf_level"].to_numpy() >= int(min_level)
+    if m.all():
+        return df.reset_index(drop=True)
+    return df[m].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +372,11 @@ def spatiotemporal_labels(df: pd.DataFrame, distance_km: float, window_min: floa
 
     if len(pairs):
         i, j = pairs[:, 0], pairs[:, 1]
-        ok = (np.abs(t_min[i] - t_min[j]) <= window_min) & (
-            haversine_km(lat[i], lon[i], lat[j], lon[j]) <= distance_km
-        )
-        i, j = i[ok], j[ok]
+        dt_ok = np.abs(t_min[i] - t_min[j]) <= window_min
+        i, j = i[dt_ok], j[dt_ok]
+        if len(i):
+            dist_ok = haversine_km(lat[i], lon[i], lat[j], lon[j]) <= distance_km
+            i, j = i[dist_ok], j[dist_ok]
     else:
         i = j = np.array([], dtype=int)
 
@@ -318,22 +414,33 @@ def build_events(points: pd.DataFrame) -> pd.DataFrame:
     ev["longitude"] = ev["_wlon"] / ev["_w"]
     ev = ev.drop(columns=["_wlat", "_wlon", "_w"])
 
-    # Hızlı uydu listesi: tek pikselli olaylar doğrudan aktarılır, çoklular birleştirilir
-    counts = p["event_idx"].value_counts()
-    singles = counts[counts == 1].index
-    multis = counts[counts > 1].index
-    sat_series = pd.Series(index=ev.index, dtype=object)
-
-    first_pts = p.drop_duplicates("event_idx").set_index("event_idx")
-    sat_series.loc[singles] = first_pts.loc[singles, "satellite"]
-    if len(multis):
-        multi_pts = p[p["event_idx"].isin(multis)][["event_idx", "satellite"]].drop_duplicates()
-        sat_series.loc[multis] = multi_pts.groupby("event_idx")["satellite"].agg(lambda s: ",".join(sorted(s)))
-    ev["satellites"] = sat_series
+    # Fast bitmask lookup for comma-sorted satellite lists per event
+    sats_cat = pd.Categorical(p["satellite"].fillna(""))
+    uniq_sats = [str(s) for s in sats_cat.categories]
+    if len(uniq_sats) <= 16:
+        order = np.argsort(uniq_sats)
+        sorted_sats = [uniq_sats[i] for i in order]
+        rank_of_code = np.empty(len(uniq_sats), dtype=int)
+        rank_of_code[order] = np.arange(len(uniq_sats))
+        bits = 1 << rank_of_code[sats_cat.codes]
+        n_ev = int(p["event_idx"].max()) + 1
+        masks = np.zeros(n_ev, dtype=int)
+        np.bitwise_or.at(masks, p["event_idx"].to_numpy(), bits)
+        lookup = np.array(
+            [
+                ",".join(sorted_sats[b] for b in range(len(sorted_sats)) if (m & (1 << b)) and sorted_sats[b])
+                for m in range(1 << len(sorted_sats))
+            ],
+            dtype=object,
+        )
+        ev["satellites"] = lookup[masks[ev.index.to_numpy()]]
+    else:
+        dedup_sat = p[["event_idx", "satellite"]].drop_duplicates().sort_values(["event_idx", "satellite"])
+        ev["satellites"] = dedup_sat.groupby("event_idx", sort=False)["satellite"].agg(",".join)
 
     # Geçiş bazında FRP toplamı, ardından sensör bazında ortalama
-    per_pass = p.groupby(["event_idx", "instrument", "satellite"], as_index=False)["frp"].sum()
-    per_sensor = per_pass.groupby(["event_idx", "instrument"])["frp"].mean().unstack("instrument", fill_value=0.0)
+    per_pass = p.groupby(["event_idx", "instrument", "satellite"], sort=False, as_index=False)["frp"].sum()
+    per_sensor = per_pass.groupby(["event_idx", "instrument"], sort=False)["frp"].mean().unstack("instrument", fill_value=0.0)
     ev["frp_modis_mw"] = per_sensor.get("MODIS", pd.Series(0.0, index=ev.index)).reindex(ev.index).fillna(0.0)
     ev["frp_viirs_mw"] = per_sensor.get("VIIRS", pd.Series(0.0, index=ev.index)).reindex(ev.index).fillna(0.0)
 
@@ -346,8 +453,9 @@ def build_events(points: pd.DataFrame) -> pd.DataFrame:
     ev["conf_class"] = ev["conf_level"].map(CONF_NAMES)
     ev["acq_date"] = ev["utc_timestamp"].dt.normalize()
     ev = ev.sort_values("utc_timestamp", kind="stable").reset_index()
-    seq = ev.groupby("acq_date").cumcount() + 1
-    ev["unified_hotspot_id"] = "KOZ-" + ev["acq_date"].dt.strftime("%Y%m%d") + "-" + seq.astype(str).str.zfill(5)
+    seq = ev.groupby("acq_date", sort=False).cumcount() + 1
+    ymd = (ev["acq_date"].dt.year * 10000 + ev["acq_date"].dt.month * 100 + ev["acq_date"].dt.day).astype(str)
+    ev["unified_hotspot_id"] = "KOZ-" + ymd + "-" + seq.astype(str).str.zfill(5)
     return ev
 
 
@@ -499,24 +607,23 @@ def detect_static_sources(
     for offset in (0.0, 0.5):
         key = _grid_keys(lat, lon, cell_km, offset)
         sub = pd.DataFrame({"key": key, "year": year, "day": day, "month": month})
-        stats = sub.groupby(["key", "year"]).agg(nd=("day", "nunique"), nm=("month", "nunique")).reset_index()
-        is_stat_year = (stats["nd"] >= min_days) & (stats["nm"] >= min_months)
-        stat_keys = set(stats.loc[is_stat_year, "key"])
-        key_max = stats.groupby("key").agg(nd=("nd", "max"), nm=("nm", "max"))
-        k_nd = key_max["nd"].to_dict()
-        k_nm = key_max["nm"].to_dict()
+        st_df = sub.groupby(["key", "year"], sort=False).agg(nd=("day", "nunique"), nm=("month", "nunique")).reset_index()
+        is_stat_year = (st_df["nd"] >= min_days) & (st_df["nm"] >= min_months)
+        stat_keys = st_df.loc[is_stat_year, "key"].to_numpy()
+        key_max = st_df.groupby("key", sort=False).agg(nd=("nd", "max"), nm=("nm", "max"))
 
-        flag |= np.isin(key, list(stat_keys))
-        days_best = np.maximum(days_best, np.array([k_nd.get(k, 0) for k in key]))
-        months_best = np.maximum(months_best, np.array([k_nm.get(k, 0) for k in key]))
+        k_idx = pd.Index(key)
+        flag |= k_idx.isin(stat_keys)
+        days_best = np.maximum(days_best, key_max["nd"].reindex(k_idx, fill_value=0).to_numpy())
+        months_best = np.maximum(months_best, key_max["nm"].reindex(k_idx, fill_value=0).to_numpy())
 
     is_static = pd.Series(flag, index=events.index)
     st = events.assign(persistence_days=days_best, persistence_months=months_best)[flag]
     if st.empty:
         return is_static, pd.DataFrame()
-    # Komşu statik hücreleri tek tesis olarak birleştir (yalnızca mekansal bağlantı)
-    site_lbl = spatiotemporal_labels(
-        st.assign(utc_timestamp=pd.Timestamp("2000-01-01")), distance_km=cell_km * 1.5, window_min=1.0
+    # Komşu statik hücreleri tek tesis olarak birleştir (mikro-hücre hızlandırmalı mekansal bağlantı)
+    site_lbl = _spatial_components(
+        st["latitude"].to_numpy(float), st["longitude"].to_numpy(float), distance_km=cell_km * 1.5
     )
     sites = (
         st.assign(site=site_lbl)
@@ -597,16 +704,26 @@ def run_pipeline(std_points: pd.DataFrame, params: PipelineParams) -> PipelineRe
     curve = estimate_modis_detection_curve(events)
     events = apply_modis_equivalence(events, curve)
 
-    id_map = events.set_index("event_idx")
-    pts["unified_hotspot_id"] = pts["event_idx"].map(id_map["unified_hotspot_id"])
-    pts["is_static_source"] = pts["event_idx"].map(id_map["is_static_source"]).astype(bool)
+    # Doğrudan dizi indeksleme ile hızlı eşleştirme
+    n_ev = len(events)
+    ev_idx_arr = events["event_idx"].to_numpy()
+    id_lookup = np.empty(n_ev, dtype=object)
+    stat_lookup = np.empty(n_ev, dtype=bool)
+    id_lookup[ev_idx_arr] = events["unified_hotspot_id"].to_numpy()
+    stat_lookup[ev_idx_arr] = events["is_static_source"].to_numpy()
 
-    n_pts, n_ev = len(pts), len(events)
+    pts_eidx = pts["event_idx"].to_numpy()
+    pts["unified_hotspot_id"] = id_lookup[pts_eidx]
+    pts["is_static_source"] = stat_lookup[pts_eidx]
+
+    n_pts = len(pts)
     dyn = ~events["is_static_source"]
+    inst_arr = pts["instrument"].to_numpy()
+    raw_modis = int((inst_arr == "MODIS").sum())
     stats_ = {
         "raw_points": n_pts,
-        "raw_modis": int((pts["instrument"] == "MODIS").sum()),
-        "raw_viirs": int((pts["instrument"] == "VIIRS").sum()),
+        "raw_modis": raw_modis,
+        "raw_viirs": n_pts - raw_modis,
         "events": n_ev,
         "dedup_ratio": 1.0 - n_ev / n_pts if n_pts else 0.0,
         "static_events": int(events["is_static_source"].sum()),
@@ -693,25 +810,26 @@ def annual_series(points: pd.DataFrame, events: pd.DataFrame, cell_km: float = 1
     py = points["acq_date"].dt.year
     ey = events["acq_date"].dt.year
     cd = cell_day_table(events, cell_km)
+    inst_arr = points["instrument"].to_numpy()
     df = pd.DataFrame(
         {
-            "Raw MODIS Pixels": points[points["instrument"] == "MODIS"].groupby(py)["point_id"].count(),
-            "Raw VIIRS Pixels": points[points["instrument"] == "VIIRS"].groupby(py)["point_id"].count(),
-            "KOZ Harmonized Events": events.groupby(ey)["unified_hotspot_id"].count(),
+            "Raw MODIS Pixels": py[inst_arr == "MODIS"].value_counts(),
+            "Raw VIIRS Pixels": py[inst_arr == "VIIRS"].value_counts(),
+            "KOZ Harmonized Events": ey.value_counts(),
             "KOZ MODIS-Equivalent Cell-Days": cd.groupby(cd["acq_date"].dt.year)["modis_eq_weight"].sum(),
         }
     )
     years = range(int(ey.min()), int(ey.max()) + 1)
     df = df.reindex(years).fillna(0).round(0).astype(int)
     df.insert(0, "Raw Total (MODIS+VIIRS)", df["Raw MODIS Pixels"] + df["Raw VIIRS Pixels"])
-    
+
     # Backwards-compatibility aliases for Turkish callers
     df["Ham MODIS piksel"] = df["Raw MODIS Pixels"]
     df["Ham VIIRS piksel"] = df["Raw VIIRS Pixels"]
     df["KÖZ harmonize olay"] = df["KOZ Harmonized Events"]
     df["KÖZ MODIS-eşdeğer hücre-günü"] = df["KOZ MODIS-Equivalent Cell-Days"]
     df["Ham toplam (MODIS+VIIRS)"] = df["Raw Total (MODIS+VIIRS)"]
-    
+
     df.index.name = "year"
     return df
 
@@ -754,14 +872,22 @@ EXPORT_COLUMNS = [
 ]
 
 
+def _fast_format_utc(s: pd.Series) -> pd.Series:
+    return pd.Series(s.to_numpy(dtype="datetime64[m]").astype("U16"), index=s.index) + "Z"
+
+
+def _fast_format_date(s: pd.Series) -> pd.Series:
+    return pd.Series(s.to_numpy(dtype="datetime64[D]").astype("U10"), index=s.index)
+
+
 def export_table(events: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in EXPORT_COLUMNS if c in events.columns]
     out = events[cols].copy()
     for c in ("utc_timestamp", "utc_end"):
         if c in out:
-            out[c] = out[c].dt.strftime("%Y-%m-%dT%H:%MZ")
+            out[c] = _fast_format_utc(out[c])
     if "acq_date" in out:
-        out["acq_date"] = out["acq_date"].dt.strftime("%Y-%m-%d")
+        out["acq_date"] = _fast_format_date(out["acq_date"])
     for c in ("latitude", "longitude"):
         out[c] = out[c].round(5)
     for c in ("frp_modis_mw", "frp_viirs_mw", "frp_viirs_calibrated_mw", "calibrated_frp_mw"):
@@ -860,14 +986,14 @@ class SyntheticFIRMSGenerator:
         buckets: dict[str, list[dict]] = {"MODIS": [], "VIIRS": []}
         weights = np.array([r[3] for r in self.FIRE_REGIMES], float)
         weights /= weights.sum()
+        regime_probs = [np.asarray(r[4], float) / np.sum(r[4]) for r in self.FIRE_REGIMES]
 
         for year in range(start_year, end_year + 1):
             sats = [s for s in self.SATELLITES if s[2] <= year]
             n_fires = rng.poisson(self.fires_per_year * rng.lognormal(0, 0.25))
             for ri in rng.choice(len(self.FIRE_REGIMES), size=n_fires, p=weights):
-                _, anchors, spread, _, mw, med_power = self.FIRE_REGIMES[ri]
-                mw = np.asarray(mw, float)
-                month = int(rng.choice(12, p=mw / mw.sum())) + 1
+                _, anchors, spread, _, _, med_power = self.FIRE_REGIMES[ri]
+                month = int(rng.choice(12, p=regime_probs[ri])) + 1
                 dim = calendar.monthrange(year, month)[1]
                 start = datetime(year, month, int(rng.integers(1, dim + 1)))
                 a_lat, a_lon = anchors[rng.integers(len(anchors))]
