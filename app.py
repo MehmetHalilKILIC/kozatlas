@@ -6,6 +6,7 @@ Run command:  streamlit run app.py
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from datetime import date, timedelta
@@ -18,7 +19,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from folium.plugins import Fullscreen, MiniMap
-from streamlit_folium import st_folium
 
 import harmonizer as hz
 
@@ -35,7 +35,8 @@ BG, CARD, EMBER, AMBER = "#0B0F19", "#1E293B", "#FF5722", "#FF9800"
 C_MODIS, C_VIIRS, C_KOZ, C_STATIC = "#38BDF8", "#FACC15", "#FF5722", "#A855F7"
 MONTHS_EN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 CONF_OPTIONS = {"low (all)": 0, "nominal": 1, "high": 2}
-MAP_LAYER_CAP = 800
+MAP_LAYER_CAP = 500
+MAP_POINT_CAP = 700
 CUSTOM_AOI = "Custom Bounding Box"
 DARK_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
 SAT_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -92,24 +93,24 @@ def fmt_int(x) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Data Loading & Cached Analytics
+# Zero-Copy Cached Data & Pipeline Loaders
 # ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading demo archive…")
-def _load_full_demo_archive(seed: int = 42) -> pd.DataFrame:
+@st.cache_resource(show_spinner=False)
+def _load_demo_parquet() -> pd.DataFrame:
     p = Path(__file__).resolve().parent / "data" / "demo_firms.parquet"
-    if p.exists() and seed == 42:
+    if p.exists():
         return pd.read_parquet(p)
-    return hz.standardize_firms(hz.SyntheticFIRMSGenerator(seed=seed).generate(2000, 2025))
+    return hz.standardize_firms(hz.SyntheticFIRMSGenerator(seed=42).generate(2000, 2025))
 
 
-@st.cache_data(show_spinner="Loading demo archive…")
+@st.cache_resource(show_spinner="Loading demo archive…")
 def load_synthetic(y0: int, y1: int, seed: int = 42) -> pd.DataFrame:
-    df = _load_full_demo_archive(seed)
-    yrs = df["acq_date"].dt.year
-    m = (yrs >= y0) & (yrs <= y1)
-    if m.all():
-        return df
-    return df[m].reset_index(drop=True)
+    if seed == 42:
+        df = _load_demo_parquet()
+        if y0 == 2000 and y1 == 2025:
+            return df
+        return df[(df["acq_date"].dt.year >= y0) & (df["acq_date"].dt.year <= y1)].reset_index(drop=True)
+    return hz.standardize_firms(hz.SyntheticFIRMSGenerator(seed=seed).generate(y0, y1))
 
 
 @st.cache_data(show_spinner="Fetching telemetry from NASA FIRMS Area API…", ttl=3600)
@@ -124,51 +125,119 @@ def load_csv(blobs: tuple) -> pd.DataFrame:
     return hz.standardize_firms(pd.concat(frames, ignore_index=True))
 
 
-@st.cache_data(show_spinner="Executing Spatiotemporal Harmonization Pipeline (Stages 1–4)…")
-def run_cached(std: pd.DataFrame, bbox: tuple, d0: date, d1: date, params: dict) -> hz.PipelineResult:
-    data = hz.filter_dates(hz.filter_aoi(std, bbox), d0, d1) if not std.empty else std
-    return hz.run_pipeline(data, hz.PipelineParams(**params))
+@st.cache_resource(show_spinner="Running Spatiotemporal Harmonization Pipeline…")
+def run_cached(_std: pd.DataFrame, source_token: tuple, bbox: tuple, d0: date, d1: date, params_items: tuple) -> hz.PipelineResult:
+    data = hz.filter_dates(hz.filter_aoi(_std, bbox), d0, d1) if not _std.empty else _std
+    return hz.run_pipeline(data, hz.PipelineParams(**dict(params_items)))
 
 
-@st.cache_data(show_spinner=False)
-def _cached_monthly_matrix(events: pd.DataFrame, metric: str, cell_km: float) -> pd.DataFrame:
-    return hz.monthly_matrix(events, metric, cell_km=cell_km)
+@st.cache_data(show_spinner=False, max_entries=16)
+def build_map_html(
+    _ev_m: pd.DataFrame,
+    _pt_m: pd.DataFrame,
+    _static_sites: pd.DataFrame,
+    cache_key: tuple,
+    bbox: tuple,
+    basemap: str,
+) -> str:
+    center = [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2]
+    zoom = 6 if (bbox[2] - bbox[0]) > 8 else 8
+    tile_url, tile_attr = (
+        (DARK_TILES, "Esri, HERE, Garmin, OpenStreetMap contributors")
+        if basemap.startswith("Dark")
+        else (SAT_TILES, "Esri World Imagery")
+    )
+    fmap = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True, prefer_canvas=True)
+    folium.TileLayer(tiles=tile_url, attr=tile_attr, name=basemap, max_zoom=16 if basemap.startswith("Dark") else 19).add_to(fmap)
+    folium.Rectangle([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], color=EMBER, weight=1, fill=False, dash_array="6").add_to(fmap)
 
+    lyr_m = folium.FeatureGroup(name="Raw MODIS (1 km)", show=True)
+    lyr_v = folium.FeatureGroup(name="Raw VIIRS (375 m)", show=True)
+    lyr_k = folium.FeatureGroup(name="KOZ Harmonized Events", show=True)
+    lyr_s = folium.FeatureGroup(name="Static Industrial Sources", show=True)
 
-@st.cache_data(show_spinner=False)
-def _cached_annual_series(points: pd.DataFrame, events: pd.DataFrame, cell_km: float) -> pd.DataFrame:
-    return hz.annual_series(points, events, cell_km=cell_km)
+    for r in _static_sites.itertuples(index=False):
+        folium.Marker(
+            [r.latitude, r.longitude],
+            icon=folium.Icon(color="purple", icon="industry", prefix="fa"),
+            popup=folium.Popup(
+                f"<b>{r.static_site_id}</b> — Static Industrial Thermal Source<br>"
+                f"Events: {r.event_count} · Active Days: {r.active_days}<br>"
+                f"Peak Annual Activity: {r.max_days_in_year} days / {r.max_months_in_year} months<br>"
+                f"First–Last Seen: {r.first_seen:%Y-%m-%d} – {r.last_seen:%Y-%m-%d}<br>"
+                f"Mean Calibrated FRP: {r.mean_calibrated_frp_mw:.1f} MW",
+                max_width=300,
+            ),
+            tooltip=r.static_site_id,
+        ).add_to(lyr_s)
 
+    for lyr in (lyr_m, lyr_v, lyr_k, lyr_s):
+        lyr.add_to(fmap)
+    folium.LayerControl(collapsed=False).add_to(fmap)
+    Fullscreen().add_to(fmap)
+    MiniMap(toggle_display=True, tile_layer=folium.TileLayer(tiles=DARK_TILES, attr="Esri")).add_to(fmap)
 
-@st.cache_data(show_spinner=False)
-def _cached_export_bundle(
-    events: pd.DataFrame, points: pd.DataFrame, static_sites: pd.DataFrame
-) -> tuple[pd.DataFrame, bytes, bytes | None, bytes]:
-    out = hz.export_table(events)
-    out_csv = out.to_csv(index=False).encode("utf-8")
+    pt_sub = _pt_m.nlargest(MAP_POINT_CAP, "frp") if len(_pt_m) > MAP_POINT_CAP else _pt_m
+    pts_json = json.dumps([
+        [round(r.latitude, 4), round(r.longitude, 4), 1 if r.instrument == "MODIS" else 0,
+         f"{r.instrument} · {r.satellite} · {r.utc_timestamp:%Y-%m-%d %H:%M}Z · FRP {r.frp:.1f} MW"]
+        for r in pt_sub.itertuples(index=False)
+    ])
+    frp_ref = max(float(_ev_m["calibrated_frp_mw"].quantile(0.95)) if len(_ev_m) else 1.0, 1.0)
+    evs_json = json.dumps([
+        [round(r.latitude, 4), round(r.longitude, 4), round(4 + 10 * min(r.calibrated_frp_mw / frp_ref, 1.0), 1),
+         1 if r.is_static_source else 0, r.unified_hotspot_id, r.event_class, r.sensor_label,
+         int(r.merged_pixel_count), int(r.n_modis), int(r.n_viirs), r.satellites,
+         f"{r.utc_timestamp:%Y-%m-%d %H:%M} – {r.utc_end:%H:%M}",
+         round(r.frp_modis_mw, 1), round(r.frp_viirs_mw, 1), round(r.calibrated_frp_mw, 1),
+         round(r.modis_eq_weight, 2), r.conf_class]
+        for r in _ev_m.itertuples(index=False)
+    ])
 
-    sites_csv = None
-    if not static_sites.empty:
-        sites = static_sites.copy()
-        for c in ("first_seen", "last_seen"):
-            sites[c] = hz._fast_format_date(sites[c])
-        sites_csv = sites.to_csv(index=False).encode("utf-8")
-
-    raw_cols = [
-        "point_id", "unified_hotspot_id", "latitude", "longitude", "utc_timestamp", "instrument", "satellite",
-        "source", "frp", "brightness_k", "brightness_2_k", "scan", "track", "conf_class", "daynight", "is_static_source",
-    ]
-    raw_out = points[raw_cols].copy()
-    raw_out["utc_timestamp"] = hz._fast_format_utc(raw_out["utc_timestamp"])
-    raw_csv = raw_out.to_csv(index=False).encode("utf-8")
-    return out, out_csv, sites_csv, raw_csv
+    js = f"""
+    (function() {{
+        var pts = {pts_json};
+        var evs = {evs_json};
+        var lm = {lyr_m.get_name()}, lv = {lyr_v.get_name()}, lk = {lyr_k.get_name()};
+        for (var i = 0; i < pts.length; i++) {{
+            var p = pts[i], isM = p[2] === 1;
+            L.circle([p[0], p[1]], {{
+                radius: isM ? 500 : 187.5,
+                color: isM ? "{C_MODIS}" : "{C_VIIRS}",
+                weight: 1, fill: true, fillOpacity: isM ? 0.15 : 0.45
+            }}).bindTooltip(p[3]).addTo(isM ? lm : lv);
+        }}
+        for (var j = 0; j < evs.length; j++) {{
+            var e = evs[j], isS = e[3] === 1;
+            var pop = '<div style="font-family:sans-serif;font-size:12px;min-width:240px">' +
+                '<b style="color:{EMBER}">' + e[4] + '</b><br>' +
+                '<b>Class:</b> ' + e[5] + '<br><b>Sensor:</b> ' + e[6] + '<br>' +
+                '<b>Merged Pixels:</b> ' + e[7] + ' (MODIS ' + e[8] + ', VIIRS ' + e[9] + ')<br>' +
+                '<b>Satellites:</b> ' + e[10] + '<br><b>Time (UTC):</b> ' + e[11] + '<br>' +
+                '<b>FRP MODIS / VIIRS:</b> ' + e[12] + ' / ' + e[13] + ' MW<br>' +
+                '<b>Calibrated FRP:</b> ' + e[14] + ' MW<br>' +
+                '<b>MODIS-Equivalent Weight:</b> ' + e[15] + '<br>' +
+                '<b>Confidence:</b> ' + e[16] + '<br>' +
+                '<b>Coordinates:</b> ' + e[0] + ', ' + e[1] + '</div>';
+            L.circleMarker([e[0], e[1]], {{
+                radius: e[2],
+                color: isS ? "{C_STATIC}" : "{C_KOZ}",
+                weight: 1.5, fill: true,
+                fillColor: isS ? "{C_STATIC}" : "{AMBER}",
+                fillOpacity: 0.75
+            }}).bindTooltip(e[4] + " · " + e[14] + " MW").bindPopup(pop, {{maxWidth: 320}}).addTo(lk);
+        }}
+    }})();
+    """
+    fmap.get_root().script.add_child(folium.Element(js))
+    return fmap.get_root().render()
 
 
 # ---------------------------------------------------------------------------
 # Sidebar: Control Panel
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown(f"### 🔥 KOZ Atlas Control Panel")
+    st.markdown("### 🔥 KOZ Atlas Control Panel")
 
     st.markdown("**1 · Area of Interest (AOI)**")
     aoi_choices = list(hz.AOI_PRESETS)[:3] + [CUSTOM_AOI]
@@ -193,9 +262,11 @@ with st.sidebar:
 
     std = pd.DataFrame()
     fetch_errors: list[str] = []
+    source_token: tuple = ("empty",)
     if mode.startswith("Built-in"):
         y0, y1 = st.slider("Simulation years", 2000, 2025, (2000, 2025))
         std = load_synthetic(y0, y1)
+        source_token = ("demo", y0, y1)
     elif mode.startswith("Live"):
         map_key = st.text_input("FIRMS MAP_KEY", type="password", help="Get free key: " + FIRMS_KEY_URL)
         sources = st.multiselect("FIRMS sources", hz.FIRMS_SOURCES, default=["MODIS_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"])
@@ -208,10 +279,14 @@ with st.sidebar:
             st.session_state["api_args"] = (map_key, tuple(sources), bbox, d_api[0], d_api[1])
         if "api_args" in st.session_state:
             std, fetch_errors = load_firms(*st.session_state["api_args"])
+            source_token = ("api", st.session_state["api_args"][1], st.session_state["api_args"][2], st.session_state["api_args"][3], st.session_state["api_args"][4])
     else:
         files = st.file_uploader("FIRMS CSV (MODIS and/or VIIRS)", type=["csv"], accept_multiple_files=True)
         if files:
-            std = load_csv(tuple(f.getvalue() for f in files))
+            blobs = tuple(f.getvalue() for f in files)
+            std = load_csv(blobs)
+            h = hashlib.md5(b"".join(b[:1024] for b in blobs)).hexdigest()
+            source_token = ("csv", len(blobs), len(std), h)
 
     if not std.empty:
         dmin, dmax = std["acq_date"].min().date(), std["acq_date"].max().date()
@@ -270,7 +345,8 @@ if std.empty:
     st.info("Please select a data source: live FIRMS API (requires MAP_KEY) or upload FIRMS CSV files.")
     st.stop()
 
-res = run_cached(std, tuple(bbox), d0, d1, params)
+run_key = (source_token, tuple(bbox), d0, d1, tuple(sorted(params.items())))
+res = run_cached(std, source_token, tuple(bbox), d0, d1, tuple(sorted(params.items())))
 if res.events.empty:
     st.info("No thermal anomalies detected within the selected region / date range / confidence threshold.")
     st.stop()
@@ -299,14 +375,14 @@ tab_map, tab_cal, tab_proof, tab_dl = st.tabs(
 # Tab 1 — Interactive Satellite Map
 # ---------------------------------------------------------------------------
 with tab_map:
-    ev_ym = events_view["acq_date"].dt.year * 100 + events_view["acq_date"].dt.month
-    ym_counts = ev_ym.value_counts().sort_index()
-    if ym_counts.empty:
+    ym_int = events_view["acq_date"].dt.year * 100 + events_view["acq_date"].dt.month
+    month_counts = ym_int.value_counts().sort_index()
+    if month_counts.empty:
         st.info("No events to display on the map.")
     else:
-        options = [f"{ym // 100:04d}-{ym % 100:02d}" for ym in ym_counts.index]
-        last_year = int(ym_counts.index.max()) // 100
-        recent = ym_counts[ym_counts.index >= last_year * 100]
+        options = [f"{ym // 100:04d}-{ym % 100:02d}" for ym in month_counts.index]
+        last_year = int(month_counts.index.max()) // 100
+        recent = month_counts[[ym // 100 == last_year for ym in month_counts.index]]
         best_ym = int(recent.idxmax())
         default = f"{best_ym // 100:04d}-{best_ym % 100:02d}"
         c1, c2 = st.columns([1, 3])
@@ -322,91 +398,27 @@ with tab_map:
             unsafe_allow_html=True,
         )
 
-        sel_y, sel_m = int(sel_month[:4]), int(sel_month[5:7])
-        target_ym = sel_y * 100 + sel_m
-        pt_ym = points_view["acq_date"].dt.year * 100 + points_view["acq_date"].dt.month
-        ev_m = events_view[ev_ym == target_ym]
-        pt_m = points_view[pt_ym == target_ym]
+        sel_y, sel_m = map(int, sel_month.split("-"))
+        ev_m = events_view[(events_view["acq_date"].dt.year == sel_y) & (events_view["acq_date"].dt.month == sel_m)]
+        pt_m = points_view[(points_view["acq_date"].dt.year == sel_y) & (points_view["acq_date"].dt.month == sel_m)]
         if len(ev_m) > MAP_LAYER_CAP:
             ev_m = ev_m.nlargest(MAP_LAYER_CAP, "calibrated_frp_mw")
             pt_m = pt_m[pt_m["unified_hotspot_id"].isin(ev_m["unified_hotspot_id"])]
             c1.caption(f"Showing top {MAP_LAYER_CAP} events by FRP for performance.")
 
-        center = [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2]
-        zoom = 6 if (bbox[2] - bbox[0]) > 8 else 8
-        tile_url, tile_attr = (DARK_TILES, "Esri, HERE, Garmin, OpenStreetMap contributors") if basemap.startswith("Dark") \
-            else (SAT_TILES, "Esri World Imagery")
-        fmap = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True, prefer_canvas=True)
-        folium.TileLayer(tiles=tile_url, attr=tile_attr, name=basemap, max_zoom=16 if basemap.startswith("Dark") else 19).add_to(fmap)
-        folium.Rectangle([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], color=EMBER, weight=1, fill=False, dash_array="6").add_to(fmap)
-
-        lyr_m = folium.FeatureGroup(name="Raw MODIS (1 km)", show=True)
-        lyr_v = folium.FeatureGroup(name="Raw VIIRS (375 m)", show=True)
-        lyr_k = folium.FeatureGroup(name="KOZ Harmonized Events", show=True)
-        lyr_s = folium.FeatureGroup(name="Static Industrial Sources", show=True)
-
-        for r in pt_m.itertuples(index=False):
-            is_m = r.instrument == "MODIS"
-            folium.Circle(
-                [r.latitude, r.longitude],
-                radius=500 if is_m else 187.5,
-                color=C_MODIS if is_m else C_VIIRS,
-                weight=1,
-                fill=True,
-                fill_opacity=0.15 if is_m else 0.45,
-                tooltip=f"{r.instrument} · {r.satellite} · {r.utc_timestamp:%Y-%m-%d %H:%M}Z · FRP {r.frp:.1f} MW",
-            ).add_to(lyr_m if is_m else lyr_v)
-
-        frp_ref = max(float(ev_m["calibrated_frp_mw"].quantile(0.95)) if len(ev_m) else 1.0, 1.0)
-        for r in ev_m.itertuples(index=False):
-            popup = f"""
-            <div style="font-family:sans-serif;font-size:12px;min-width:240px">
-            <b style="color:{EMBER}">{r.unified_hotspot_id}</b><br>
-            <b>Class:</b> {r.event_class}<br>
-            <b>Sensor:</b> {r.sensor_label}<br>
-            <b>Merged Pixels:</b> {r.merged_pixel_count} (MODIS {r.n_modis}, VIIRS {r.n_viirs})<br>
-            <b>Satellites:</b> {r.satellites}<br>
-            <b>Time (UTC):</b> {r.utc_timestamp:%Y-%m-%d %H:%M} – {r.utc_end:%H:%M}<br>
-            <b>FRP MODIS / VIIRS:</b> {r.frp_modis_mw:.1f} / {r.frp_viirs_mw:.1f} MW<br>
-            <b>Calibrated FRP:</b> {r.calibrated_frp_mw:.1f} MW<br>
-            <b>MODIS-Equivalent Weight:</b> {r.modis_eq_weight:.2f}<br>
-            <b>Confidence:</b> {r.conf_class}<br>
-            <b>Coordinates:</b> {r.latitude:.4f}, {r.longitude:.4f}
-            </div>"""
-            folium.CircleMarker(
-                [r.latitude, r.longitude],
-                radius=float(4 + 10 * min(r.calibrated_frp_mw / frp_ref, 1.0)),
-                color=C_STATIC if r.is_static_source else C_KOZ,
-                weight=1.5,
-                fill=True,
-                fill_color=AMBER if not r.is_static_source else C_STATIC,
-                fill_opacity=0.75,
-                popup=folium.Popup(popup, max_width=320),
-                tooltip=f"{r.unified_hotspot_id} · {r.calibrated_frp_mw:.1f} MW",
-            ).add_to(lyr_k)
-
-        for r in res.static_sites.itertuples(index=False):
-            folium.Marker(
-                [r.latitude, r.longitude],
-                icon=folium.Icon(color="purple", icon="industry", prefix="fa"),
-                popup=folium.Popup(
-                    f"<b>{r.static_site_id}</b> — Static Industrial Thermal Source<br>"
-                    f"Events: {r.event_count} · Active Days: {r.active_days}<br>"
-                    f"Peak Annual Activity: {r.max_days_in_year} days / {r.max_months_in_year} months<br>"
-                    f"First–Last Seen: {r.first_seen:%Y-%m-%d} – {r.last_seen:%Y-%m-%d}<br>"
-                    f"Mean Calibrated FRP: {r.mean_calibrated_frp_mw:.1f} MW",
-                    max_width=300,
-                ),
-                tooltip=r.static_site_id,
-            ).add_to(lyr_s)
-
-        for lyr in (lyr_m, lyr_v, lyr_k, lyr_s):
-            lyr.add_to(fmap)
-        folium.LayerControl(collapsed=False).add_to(fmap)
-        Fullscreen().add_to(fmap)
-        MiniMap(toggle_display=True, tile_layer=folium.TileLayer(tiles=DARK_TILES, attr="Esri")).add_to(fmap)
+        map_html = build_map_html(
+            ev_m,
+            pt_m,
+            res.static_sites,
+            (run_key, hide_static, sel_month, basemap),
+            tuple(bbox),
+            basemap,
+        )
         with c2:
-            st_folium(fmap, height=640, use_container_width=True, returned_objects=[], key=f"map_{sel_month}_{basemap}")
+            if hasattr(st, "iframe"):
+                st.iframe(map_html, height=640)
+            else:
+                st.components.v1.html(map_html, height=640)
             st.caption(
                 f"{sel_month}: {fmt_int(len(pt_m))} raw pixels → {fmt_int(len(ev_m))} KOZ events · "
                 f"Δd ≤ {distance_km:.1f} km, |Δt| ≤ {window_min} min"
@@ -418,7 +430,7 @@ with tab_map:
 with tab_cal:
     c1, c2, c3 = st.columns([2, 1, 1])
     metric = c1.selectbox("Calendar metric", list(hz.CALENDAR_METRICS), format_func=hz.CALENDAR_METRICS.get)
-    mat = _cached_monthly_matrix(events_view, metric, cell_km=params["static_cell_km"])
+    mat = hz.monthly_matrix(events_view, metric, cell_km=params["static_cell_km"])
     years = list(mat.index)
     sel_year = c2.selectbox("Year", years[::-1])
     sel_mon = c3.selectbox("Month", list(range(1, 13)), index=int(events_view["acq_date"].dt.month.mode().iloc[0]) - 1,
@@ -492,7 +504,7 @@ with tab_cal:
 # Tab 3 — Sensor Harmonization Evidence
 # ---------------------------------------------------------------------------
 with tab_proof:
-    ann = _cached_annual_series(points_view, events_view, cell_km=params["static_cell_km"])
+    ann = hz.annual_series(points_view, events_view, cell_km=params["static_cell_km"])
     series_cols = {
         "Raw Total (MODIS+VIIRS)": "#64748B",
         "Raw MODIS Pixels": C_MODIS,
@@ -574,25 +586,52 @@ with tab_proof:
     st.plotly_chart(style_fig(fig_l, 360), width="stretch")
 
 # ---------------------------------------------------------------------------
-# Tab 4 — Data Download Center
+# Tab 4 — Data Download Center (On-Demand Zero-Lag Export)
 # ---------------------------------------------------------------------------
 with tab_dl:
-    out, out_csv, sites_csv, raw_csv = _cached_export_bundle(events_view, points_view, res.static_sites)
-    st.markdown(f"**Harmonized Hotspots Table** — {fmt_int(len(out))} records · {d0} to {d1} · {aoi_name}")
-    st.dataframe(out.head(500), width="stretch", hide_index=True)
+    preview = hz.export_table(events_view.head(500))
+    st.markdown(f"**Harmonized Hotspots Table** — {fmt_int(len(events_view))} records (showing top 500) · {d0} to {d1} · {aoi_name}")
+    st.dataframe(preview, width="stretch", hide_index=True)
+
     st.download_button(
         "⬇️ Download koz_atlas_harmonized_hotspots.csv",
-        out_csv,
+        data=lambda: hz.export_table(events_view).to_csv(index=False).encode("utf-8"),
         file_name="koz_atlas_harmonized_hotspots.csv",
         mime="text/csv",
         type="primary",
+        on_click="ignore",
     )
     c1, c2, c3 = st.columns(3)
-    if sites_csv is not None:
-        c1.download_button("Download Static Sources (CSV)", sites_csv,
-                           file_name="koz_atlas_static_sources.csv", mime="text/csv")
-    c2.download_button("Download Raw Pixel → Event Map (CSV)", raw_csv,
-                       file_name="koz_atlas_pixel_event_map.csv", mime="text/csv")
+    if not res.static_sites.empty:
+        def _static_csv() -> bytes:
+            sites = res.static_sites.copy()
+            for c in ("first_seen", "last_seen"):
+                sites[c] = sites[c].dt.strftime("%Y-%m-%d")
+            return sites.to_csv(index=False).encode("utf-8")
+
+        c1.download_button(
+            "Download Static Sources (CSV)",
+            data=_static_csv,
+            file_name="koz_atlas_static_sources.csv",
+            mime="text/csv",
+            on_click="ignore",
+        )
+
+    raw_cols = ["point_id", "unified_hotspot_id", "latitude", "longitude", "utc_timestamp", "instrument", "satellite",
+                "source", "frp", "brightness_k", "brightness_2_k", "scan", "track", "conf_class", "daynight", "is_static_source"]
+
+    def _raw_csv() -> bytes:
+        raw_out = points_view[raw_cols].copy()
+        raw_out["utc_timestamp"] = raw_out["utc_timestamp"].dt.strftime("%Y-%m-%dT%H:%MZ")
+        return raw_out.to_csv(index=False).encode("utf-8")
+
+    c2.download_button(
+        "Download Raw Pixel → Event Map (CSV)",
+        data=_raw_csv,
+        file_name="koz_atlas_pixel_event_map.csv",
+        mime="text/csv",
+        on_click="ignore",
+    )
     meta = {
         "project": "KOZ Atlas",
         "team": "Kirvecanlar",
@@ -610,8 +649,13 @@ with tab_dl:
         },
         "stats": {k: v for k, v in s.items() if k != "label_counts"} | {"label_counts": s["label_counts"]},
     }
-    c3.download_button("Download Run Metadata (JSON)", json.dumps(meta, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
-                       file_name="koz_atlas_run_metadata.json", mime="application/json")
+    c3.download_button(
+        "Download Run Metadata (JSON)",
+        data=lambda: json.dumps(meta, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        file_name="koz_atlas_run_metadata.json",
+        mime="application/json",
+        on_click="ignore",
+    )
 
     with st.expander("CSV Column Dictionary"):
         st.markdown(
